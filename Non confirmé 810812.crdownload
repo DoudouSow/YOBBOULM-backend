@@ -1,0 +1,153 @@
+// server.js
+const express = require('express');
+const http = require('http');
+const axios = require('axios');
+const { Server } = require('socket.io');
+const { createClient } = require('@supabase/supabase-js');
+
+const app = express();
+app.use(express.json());
+
+const server = http.createServer(app);
+const io = new Server(server, { cors: { origin: '*' } });
+
+const supabase = createClient(
+  process.env.SUPABASE_URL,
+  process.env.SUPABASE_KEY
+);
+
+/*
+  Tables Supabase attendues :
+
+  "colis"
+  - id (uuid)
+  - code_suivi (text)
+  - client_id (uuid)            -> lien vers la table clients
+  - lat, lng (float8)
+  - departement_actuel (text)   -> mis à jour automatiquement
+  - statut (text)
+  - updated_at (timestamp)
+
+  "clients"
+  - id (uuid)
+  - nom (text)
+  - telephone (text)            -> numéro donné à l'inscription, format +221XXXXXXXXX
+*/
+
+// --- Reverse geocoding : transforme lat/lng en nom de département ---
+// Utilise Nominatim (OpenStreetMap) - gratuit, suffisant pour un prototype
+async function getDepartementFromCoords(lat, lng) {
+  try {
+    const res = await axios.get('https://nominatim.openstreetmap.org/reverse', {
+      params: { lat, lon: lng, format: 'json', addressdetails: 1 },
+      headers: { 'User-Agent': 'YOBBOULMA-SN-Tracker' }
+    });
+    const addr = res.data.address;
+    // Au Sénégal, le département apparaît souvent dans county ou state_district
+    return addr.county || addr.state_district || addr.state || 'Inconnu';
+  } catch (err) {
+    console.error('Erreur reverse geocoding:', err.message);
+    return null;
+  }
+}
+
+// --- Envoi de SMS via une API externe (à remplacer par ton fournisseur) ---
+// Exemple générique - adapte selon le service utilisé au Sénégal
+// (ex: une passerelle locale, ou un service comme Twilio/Vonage)
+async function envoyerSMS(telephone, message) {
+  try {
+    // EXEMPLE avec une API générique - remplace SMS_API_URL et SMS_API_KEY
+    await axios.post(process.env.SMS_API_URL, {
+      to: telephone,
+      message: message,
+      apiKey: process.env.SMS_API_KEY
+    });
+    console.log(`SMS envoyé à ${telephone} : ${message}`);
+  } catch (err) {
+    console.error('Erreur envoi SMS:', err.message);
+  }
+}
+
+// --- Réception de la position GPS depuis l'ESP32 ---
+app.post('/api/position', async (req, res) => {
+  const { code_suivi, lat, lng } = req.body;
+
+  if (!code_suivi || lat === undefined || lng === undefined) {
+    return res.status(400).json({ error: 'Champs manquants' });
+  }
+
+  // Récupère le colis + son client associé
+  const { data: colis, error: errColis } = await supabase
+    .from('colis')
+    .select('*, clients(nom, telephone)')
+    .eq('code_suivi', code_suivi)
+    .single();
+
+  if (errColis || !colis) {
+    return res.status(404).json({ error: 'Colis non trouvé' });
+  }
+
+  // Détermine le département actuel à partir des coordonnées
+  const nouveauDepartement = await getDepartementFromCoords(lat, lng);
+  const departementAChange = nouveauDepartement &&
+    nouveauDepartement !== colis.departement_actuel;
+
+  // Met à jour la position (et le département si besoin)
+  const { data: updated, error: errUpdate } = await supabase
+    .from('colis')
+    .update({
+      lat, lng,
+      departement_actuel: nouveauDepartement || colis.departement_actuel,
+      updated_at: new Date().toISOString(),
+      statut: 'en_route'
+    })
+    .eq('code_suivi', code_suivi)
+    .select()
+    .single();
+
+  if (errUpdate) {
+    console.error(errUpdate);
+    return res.status(500).json({ error: 'Erreur mise à jour' });
+  }
+
+  // Si le colis vient d'entrer dans un nouveau département -> SMS au client
+  if (departementAChange && colis.clients?.telephone) {
+    const message = `YOBBOULMA SN : votre colis ${code_suivi} vient d'entrer dans le département de ${nouveauDepartement}.`;
+    await envoyerSMS(colis.clients.telephone, message);
+  }
+
+  // Diffuse la mise à jour en temps réel (room = département actuel)
+  io.to(updated.departement_actuel).emit('position_update', {
+    code_suivi: updated.code_suivi,
+    lat: updated.lat,
+    lng: updated.lng,
+    departement: updated.departement_actuel,
+    statut: updated.statut,
+    updated_at: updated.updated_at,
+  });
+
+  res.json({ success: true, colis: updated, departement_change: departementAChange });
+});
+
+// --- Récupérer un colis ---
+app.get('/api/colis/:code_suivi', async (req, res) => {
+  const { data, error } = await supabase
+    .from('colis')
+    .select('*')
+    .eq('code_suivi', req.params.code_suivi)
+    .single();
+
+  if (error) return res.status(404).json({ error: 'Colis non trouvé' });
+  res.json(data);
+});
+
+io.on('connection', (socket) => {
+  socket.on('join_departement', (departement) => {
+    socket.join(departement);
+  });
+});
+
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => {
+  console.log(`Serveur YOBBOULMA SN sur le port ${PORT}`);
+});
