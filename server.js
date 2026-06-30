@@ -1,16 +1,8 @@
-﻿require('dotenv').config();
+require('dotenv').config();
 const express = require('express');
 const cors = require('cors');
 const http = require('http');
 const { Server } = require('socket.io');
-
-const authRoutes = require('./routes/auth');
-const livraisonRoutes = require('./routes/livraisons');
-const gpsRoutes = require('./routes/gps');
-const paiementRoutes = require('./routes/paiements');
-const notificationRoutes = require('./routes/notifications');
-const { initGpsService } = require('./services/gpsService');
-
 const authRoutes = require('./routes/auth');
 const livraisonRoutes = require('./routes/livraisons');
 const gpsRoutes = require('./routes/gps');
